@@ -26,7 +26,6 @@ daily_df, movies_df = load_data()
 # ----------------------------------------------------
 # 2. 기준 기간 계산 (일별 표의 날짜 열에서 추출)
 # ----------------------------------------------------
-# 날짜 열이 여덟 자리 숫자(예: 20230101) 형태이므로 문자열로 바꿔 날짜로 변환
 date_col = daily_df["날짜"].astype(str)
 date_parsed = pd.to_datetime(date_col, format="%Y%m%d")
 start_date = date_parsed.min().strftime("%Y-%m-%d")
@@ -41,8 +40,18 @@ st.subheader("📋 영화별 데이터 (원본 미리보기)")
 st.dataframe(movies_df.head())
 
 # ----------------------------------------------------
+# ⚠️ 사후 집계 데이터임을 알리는 안내
+# ----------------------------------------------------
+st.warning(
+    "⚠️ **주의**: 이 표에 있는 `first_scrn`, `first_show`, `first_week_audi` 등의 변수는 "
+    "영화가 실제로 개봉되고 난 뒤에 집계된 값입니다. "
+    "따라서 이 모델은 **개봉 전에 흥행을 미리 내다보는 예측이 아니라**, "
+    "개봉 후 초반 성적을 바탕으로 최종 총 관객 수를 설명·추정하는 모델입니다. "
+    "실제 '개봉 전 흥행 예측'에 활용하려면 개봉 전에 알 수 있는 정보(장르, 국가, 시즌 등)만 써야 합니다."
+)
+
+# ----------------------------------------------------
 # 4. 영화코드 순 정렬 후 학습/테스트 분리
-#    - 열 편마다 앞의 세 편을 테스트로 떼어 놓음
 # ----------------------------------------------------
 movies_sorted = movies_df.sort_values("movieCd").reset_index(drop=True)
 
@@ -59,11 +68,10 @@ def split_train_test(df, group_size=10, test_count=3):
 train_df, test_df = split_train_test(movies_sorted, group_size=10, test_count=3)
 
 # ----------------------------------------------------
-# 5. 사용할 변수(피처) 체크박스로 선택
+# 5. 사용할 변수(피처) 체크박스로 선택 (자유 실험용)
 # ----------------------------------------------------
-st.subheader("🔧 예측에 사용할 변수 선택")
+st.subheader("🔧 예측에 사용할 변수 선택 (직접 실험해 보기)")
 
-# 회귀에 쓸 수 있는 숫자형 후보 변수들
 candidate_features = {
     "first_scrn": "첫 관측일 스크린수",
     "first_show": "첫 관측일 상영횟수",
@@ -85,67 +93,130 @@ if len(selected_features) == 0:
     st.stop()
 
 # ----------------------------------------------------
-# 6. 결측치 처리 및 학습 데이터 구성
+# 6. 모델 학습 및 평가를 위한 공통 함수
 # ----------------------------------------------------
 target = "total_audi"
 
-# 필요한 열만 뽑고 결측치가 있는 행은 제거
-use_cols = selected_features + [target]
-train_clean = train_df.dropna(subset=use_cols)
-test_clean = test_df.dropna(subset=use_cols)
+def train_and_evaluate(features, train_df, test_df, target):
+    """주어진 변수 목록으로 모델을 학습하고 평가 지표를 반환"""
+    use_cols = features + [target]
+    train_clean = train_df.dropna(subset=use_cols)
+    test_clean = test_df.dropna(subset=use_cols)
 
-X_train = train_clean[selected_features]
-y_train = train_clean[target]
-X_test = test_clean[selected_features]
-y_test = test_clean[target]
+    X_train = train_clean[features]
+    y_train = train_clean[target]
+    X_test = test_clean[features]
+    y_test = test_clean[target]
+
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    y_pred = np.clip(y_pred, a_min=0, a_max=None)
+
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    return {
+        "model": model,
+        "train_clean": train_clean,
+        "test_clean": test_clean,
+        "y_test": y_test,
+        "y_pred": y_pred,
+        "mae": mae,
+        "r2": r2,
+    }
 
 # ----------------------------------------------------
-# 7. 모델 학습
+# 7. 두 가지 변수 조합 정의 및 학습
+#    - 기본 3종: 첫 주 관객 수 제외
+#    - 기본 3종 + 첫 주 관객 수
 # ----------------------------------------------------
-model = LinearRegression()
-model.fit(X_train, y_train)
+BASE_FEATURES = ["first_scrn", "first_show", "peak"]
+EXTENDED_FEATURES = BASE_FEATURES + ["first_week_audi"]
 
-y_pred = model.predict(X_test)
-# 음수 예측값이 나올 수 있으므로 최소 0으로 클리핑 (관객수는 음수가 될 수 없음)
-y_pred = np.clip(y_pred, a_min=0, a_max=None)
+result_base = train_and_evaluate(BASE_FEATURES, train_df, test_df, target)
+result_extended = train_and_evaluate(EXTENDED_FEATURES, train_df, test_df, target)
 
 # ----------------------------------------------------
-# 8. 평가 지표 계산
+# 8. 두 모델의 평가 결과를 나란히 비교
 # ----------------------------------------------------
-mae = mean_absolute_error(y_test, y_pred)
-r2 = r2_score(y_test, y_pred)
+st.subheader("📊 변수 조합별 예측 성능 비교")
 
-st.subheader("📊 모델 학습 및 평가 결과")
+st.markdown(
+    "아래는 **기본 변수 세 가지**(스크린수·상영횟수·성수기 여부)만 쓴 경우와, "
+    "여기에 **첫 주 관객 수**까지 추가한 경우의 예측 성능을 비교한 것입니다."
+)
 
-col1, col2, col3 = st.columns(3)
-col1.metric("학습에 사용한 영화 편수", f"{len(train_clean)}편")
-col2.metric("평가에 사용한 영화 편수", f"{len(test_clean)}편")
-col3.metric("기준 기간", f"{start_date} ~ {end_date}")
+col1, col2 = st.columns(2)
 
-col4, col5 = st.columns(2)
-col4.metric("R² (결정계수)", f"{r2:.3f}")
-col5.metric("MAE (평균 절대 오차)", f"{mae:,.0f}명")
+with col1:
+    st.markdown("### 🅰️ 기본 변수 3종")
+    st.caption(", ".join(BASE_FEATURES))
+    st.metric("학습 영화 편수", f"{len(result_base['train_clean'])}편")
+    st.metric("평가 영화 편수", f"{len(result_base['test_clean'])}편")
+    st.metric("R² (결정계수)", f"{result_base['r2']:.3f}")
+    st.metric("MAE (평균 절대 오차)", f"{result_base['mae']:,.0f}명")
+
+with col2:
+    st.markdown("### 🅱️ 기본 변수 3종 + 첫 주 관객 수")
+    st.caption(", ".join(EXTENDED_FEATURES))
+    st.metric("학습 영화 편수", f"{len(result_extended['train_clean'])}편")
+    st.metric("평가 영화 편수", f"{len(result_extended['test_clean'])}편")
+    st.metric("R² (결정계수)", f"{result_extended['r2']:.3f}")
+    st.metric("MAE (평균 절대 오차)", f"{result_extended['mae']:,.0f}명")
+
+r2_diff = result_extended["r2"] - result_base["r2"]
+mae_diff = result_extended["mae"] - result_base["mae"]
+
+st.info(
+    f"첫 주 관객 수를 추가하면 R²는 **{r2_diff:+.3f}**, "
+    f"MAE는 **{mae_diff:+,.0f}명** 만큼 변화했습니다. "
+    f"(R²는 클수록, MAE는 작을수록 더 좋은 모델입니다.)"
+)
+
+st.caption(
+    "기준 기간: " + f"{start_date} ~ {end_date}"
+)
+
+# ----------------------------------------------------
+# 9. 내가 선택한 변수 조합으로 모델 학습 및 평가 (아래는 체크박스 선택 결과)
+# ----------------------------------------------------
+st.markdown("---")
+st.subheader("🔍 내가 선택한 변수 조합으로 결과 보기")
+
+result_selected = train_and_evaluate(selected_features, train_df, test_df, target)
+
+col3, col4, col5 = st.columns(3)
+col3.metric("학습에 사용한 영화 편수", f"{len(result_selected['train_clean'])}편")
+col4.metric("평가에 사용한 영화 편수", f"{len(result_selected['test_clean'])}편")
+col5.metric("기준 기간", f"{start_date} ~ {end_date}")
+
+col6, col7 = st.columns(2)
+col6.metric("R² (결정계수)", f"{result_selected['r2']:.3f}")
+col7.metric("MAE (평균 절대 오차)", f"{result_selected['mae']:,.0f}명")
 
 st.caption("MAE는 예측한 관객 수가 실제 관객 수와 평균적으로 얼마나 차이 나는지를 나타냅니다.")
 
 # ----------------------------------------------------
-# 9. 1,000명 미만 예측치 처리 (그래프 바닥에 붙이기 위한 준비)
+# 10. 1,000명 미만 예측치 처리 (그래프 바닥에 붙이기 위한 준비)
 # ----------------------------------------------------
-FLOOR_VALUE = 1000  # 로그 스케일에서 바닥에 붙일 최소값
+FLOOR_VALUE = 1000
+
+y_pred = result_selected["y_pred"]
+y_test = result_selected["y_test"]
+test_clean = result_selected["test_clean"]
 
 low_pred_count = int(np.sum(y_pred < FLOOR_VALUE))
-
-# 실제 그래프에 표시할 값 (원래 예측값은 유지하되, 화면 표시용으로만 바닥값 적용)
 y_pred_display = np.where(y_pred < FLOOR_VALUE, FLOOR_VALUE, y_pred)
 
 st.write(f"🔻 예측값이 {FLOOR_VALUE:,}명보다 작게 나온 영화: **{low_pred_count}편** (그래프 바닥에 표시됨)")
 
 # ----------------------------------------------------
-# 10. Plotly 산점도 (로그-로그 스케일, 대각선 포함)
+# 11. Plotly 산점도 (로그-로그 스케일, 대각선 포함)
 # ----------------------------------------------------
-st.subheader("📈 실제 vs 예측 총 관객 수 (테스트 영화)")
+st.subheader("📈 실제 vs 예측 총 관객 수 (테스트 영화, 선택한 변수 기준)")
 
-# 로그 스케일이므로 0 이하 값은 아주 작은 값으로 대체 (로그 계산 오류 방지)
 x_vals = np.where(y_test <= 0, 1, y_test)
 y_vals = np.where(y_pred_display <= 0, 1, y_pred_display)
 
@@ -153,7 +224,6 @@ movie_names = test_clean["movieNm"].values if "movieNm" in test_clean.columns el
 
 fig = go.Figure()
 
-# 산점도
 fig.add_trace(go.Scatter(
     x=x_vals,
     y=y_vals,
@@ -164,7 +234,6 @@ fig.add_trace(go.Scatter(
     marker=dict(size=10, color="royalblue", opacity=0.7),
 ))
 
-# 대각선 (실제값 = 예측값)
 min_val = min(x_vals.min(), y_vals.min())
 max_val = max(x_vals.max(), y_vals.max())
 fig.add_trace(go.Scatter(
@@ -186,9 +255,9 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # ----------------------------------------------------
-# 11. 테스트 결과 표로 보여주기
+# 12. 테스트 결과 표로 보여주기
 # ----------------------------------------------------
-st.subheader("🎯 테스트 영화별 예측 결과")
+st.subheader("🎯 테스트 영화별 예측 결과 (선택한 변수 기준)")
 
 result_df = test_clean[["movieCd", "movieNm"]].copy() if "movieNm" in test_clean.columns else test_clean[["movieCd"]].copy()
 result_df["실제 총 관객 수"] = y_test.values
